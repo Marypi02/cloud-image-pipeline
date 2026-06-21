@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local dataset folder
+test/dataset/
+
+# Local COCO annotations folder
+coco_annotations/
+
+# AWS SAM temporary build files
+.aws-sam/
+
+# Virtual environment folders
+.venv/
+
+# OS generated files
+.DS_Store

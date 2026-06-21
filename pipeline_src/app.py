@@ -1,0 +1,1 @@
+# Core Lambda execution script with the main handler function
