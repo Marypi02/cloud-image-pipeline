@@ -16,3 +16,6 @@ coco_annotations/
 
 # OS generated files
 .DS_Store
+
+# Lambda heavy dependencies
+layer/
