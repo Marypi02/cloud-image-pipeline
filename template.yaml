@@ -72,8 +72,6 @@ Resources:
       CompatibleRuntimes:
         - python3.12
       RetentionPolicy: Delete
-    Metadata:
-      BuildMethod: python3.12
 
   # ---------------------------------------------------------------------
   # 3 - Compute

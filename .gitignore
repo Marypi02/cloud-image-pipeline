@@ -4,6 +4,7 @@ __pycache__/
 
 # Local dataset folder
 test/dataset/
+test/results/
 
 # Local COCO annotations folder
 coco_annotations/
@@ -19,3 +20,6 @@ coco_annotations/
 
 # Lambda heavy dependencies
 layer/
+
+# AWS SAM deployment configuration
+samconfig.toml
