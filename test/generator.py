@@ -3,6 +3,18 @@ Script to blast images into S3.
 
 This script runs locally and acts like 50 or more concurrent users all uploading images at the same time, 
 to trigger the Lambda function and generate load. 
+
+Supports both architectures:
+  --arch monolith      → uploads to one InputBucket, encodes operation in key path
+  --arch microservices → uploads to the operation-specific bucket (Resize/Greyscale/Detect)
+
+Key format per architecture:
+  monolith:       {run_id}/{operation}/{category}/{index:05d}_{filename}
+  microservices:  {operation}/{run_id}/{category}/{index:05d}_{filename}
+
+CloudFormation output keys expected:
+  monolith:       InputBucketName
+  microservices:  ResizeInputBucketName | GreyscaleInputBucketName | DetectInputBucketName
 """
 
 import argparse 
@@ -22,8 +34,16 @@ DEFAULT_DATASET_DIR = os.path.join(BASE_DIR, "dataset")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
 CATEGORIES = ("small", "medium", "large")
+OPERATIONS = ("resize", "greyscale", "detect", "all")
 
-def resolve_bucket_name(bucket_arg, stack_name_arg):
+# Maps operation name, thus CloudFormation output key for microservices buckets.
+MICROSERVICES_OUTPUT_KEYS = {
+    "resize":    "ResizeInputBucketName",
+    "greyscale": "GreyscaleInputBucketName",
+    "detect":    "DetectInputBucketName",
+}
+
+def resolve_bucket_name(bucket_arg, stack_name_arg, arch, operation):
     """Either use the bucket name given directly, or look it up from the
     CloudFormation stack's Outputs (the InputBucketName output defined in
     template.yaml)."""
@@ -33,6 +53,14 @@ def resolve_bucket_name(bucket_arg, stack_name_arg):
     if not stack_name_arg:
         sys.exit("Provide either --bucket <name> or --stack-name <name> (the stack you `sam deploy`ed).")
 
+    if arch == "microservices" and operation == "all":
+        sys.exit(
+            "--operation all is only supported with --arch monolith.\n"
+            "For microservices, choose: resize, greyscale, or detect."
+        )
+
+    target_output_key = MICROSERVICES_OUTPUT_KEYS[operation] if arch == "microservices" else "InputBucketName"
+
     cf = boto3.client("cloudformation")
     try:
         response = cf.describe_stacks(StackName=stack_name_arg)
@@ -41,10 +69,11 @@ def resolve_bucket_name(bucket_arg, stack_name_arg):
 
     outputs = response["Stacks"][0].get("Outputs", [])
     for output in outputs:
-        if output["OutputKey"] == "InputBucketName":
+        if output["OutputKey"] == target_output_key:
             return output["OutputValue"]
 
-    sys.exit(f"Stack '{stack_name_arg}' has no InputBucketName output - check the stack deployed correctly.")
+    sys.exit(f"Stack '{stack_name_arg}' has no output {target_output_key} - check the stack deployed correctly."
+            f"({'microservices/template.yaml' if arch == 'microservices' else 'monolith/template.yaml'}).")
 
 def load_dataset_pool(dataset_dir, category):
     """Returns a shuffled list of (category_label, filepath) tuples for the
@@ -78,10 +107,14 @@ def build_upload_plan(pool, count):
     cycler = itertools.cycle(pool)
     return [next(cycler) for _ in range(count)]
 
-def upload_one(s3_client, bucket, run_id, index, category, filepath):
+def upload_one(s3_client, bucket, run_id, operation, arch, index, category, filepath):
     # creates a unique filename for S3
     filename = os.path.basename(filepath)
-    key = f"{run_id}/{category}/{index:05d}_{filename}"
+
+    if arch == "microservices":
+        key = f"{operation}/{run_id}/{category}/{index:05d}_{filename}"
+    else:
+        key = f"{run_id}/{operation}/{category}/{index:05d}_{filename}"
 
     start = time.perf_counter()
     try:
@@ -95,15 +128,17 @@ def upload_one(s3_client, bucket, run_id, index, category, filepath):
 
 
 def run(args):
-    bucket = resolve_bucket_name(args.bucket, args.stack_name)
+    bucket = resolve_bucket_name(args.bucket, args.stack_name, args.arch, args.operation)
     pool = load_dataset_pool(args.dataset_dir, args.category)
     plan = build_upload_plan(pool, args.count)
 
-    print(f"Bucket:      {bucket}")
-    print(f"Category:    {args.category}")
-    print(f"Count:       {args.count}")
-    print(f"Concurrency: {args.concurrency}")
-    print(f"Run ID:      {args.run_id}")
+    print(f"Architecture: {args.arch}")
+    print(f"Bucket:       {bucket}")
+    print(f"Operation:    {args.operation}")
+    print(f"Category:     {args.category}")
+    print(f"Count:        {args.count}")
+    print(f"Concurrency:  {args.concurrency}")
+    print(f"Run ID:       {args.run_id}")
     print("Uploading...")
 
     s3_client = boto3.client("s3")
@@ -112,7 +147,7 @@ def run(args):
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool_executor:
         futures = [
-            pool_executor.submit(upload_one, s3_client, bucket, args.run_id, i, category, filepath)
+            pool_executor.submit(upload_one, s3_client, bucket, args.run_id, args.operation, args.arch, i, category, filepath)
             for i, (category, filepath) in enumerate(plan)
         ]
         for completed, future in enumerate(as_completed(futures), start=1):
@@ -121,7 +156,6 @@ def run(args):
                 print(f"  {completed}/{len(futures)} done")
 
     wall_time_s = time.perf_counter() - wall_start
-
     successes = [r for r in results if r["ok"]]
     failures = [r for r in results if not r["ok"]]
     latencies = [r["latency_ms"] for r in successes]
@@ -129,7 +163,9 @@ def run(args):
     summary = {
         "run_id": args.run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "arch": args.arch,
         "bucket": bucket,
+        "operation": args.operation,
         "category": args.category,
         "requested_count": args.count,
         "concurrency": args.concurrency,
@@ -167,11 +203,12 @@ def run(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Blast images into the pipeline's S3 input bucket.")
+    parser = argparse.ArgumentParser(description="Upload images into the pipeline's S3 input bucket.")
     bucket_group = parser.add_mutually_exclusive_group()
     bucket_group.add_argument("--bucket", help="Input bucket name (skips the CloudFormation lookup)")
     bucket_group.add_argument("--stack-name", help="SAM/CloudFormation stack name to look up InputBucketName from")
-
+    parser.add_argument("--arch", choices=["monolith", "microservices"], default="monolith", help="Which architecture to use")
+    parser.add_argument("--operation", choices=OPERATIONS, default="all", help="Which operation the Lambda should perform")
     parser.add_argument("--category", choices=(*CATEGORIES, "mixed"), default="mixed")
     parser.add_argument("--count", type=int, default=50, help="Total number of images to upload")
     parser.add_argument("--concurrency", type=int, default=10, help="Number of parallel upload workers (simulated concurrent users)")

@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless image-processing pipeline (resize / grayscale / object detection
+  via MobileNet-SSD + OpenCV) for the Cloud Computing course project.
+
+Parameters:
+  MemorySize:
+    Type: Number
+    Default: 1024
+    Description: >
+      Lambda memory in MB (128-10240). Ovverade this from terminal, like: 
+      sam deploy --parameter-overrides MemorySize=512
+
+  FunctionTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda timeout in seconds (max 900).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # 1 - Storage
+  # ---------------------------------------------------------------------
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-input-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTestUploads
+            Status: Enabled
+            ExpirationInDays: 3   # keeps S3 storage cost near zero between test sessions
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-output-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireProcessedOutputs
+            Status: Enabled
+            ExpirationInDays: 3 # to avoid get charged a storage fee
+
+  # ---------------------------------------------------------------------
+  # 2 - Heavy dependencies as a Layer (to separate the heavy libraries
+  #     from the function code, thus AWS does not crash during the deployment
+  #     when it tries to upload the package and it exceeds the size limit)
+  # ---------------------------------------------------------------------
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-image-deps"
+      Description: opencv-python-headless + numpy, built for Lambda's Linux/x86_64 runtime
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # ---------------------------------------------------------------------
+  # 3 - Compute
+  # ---------------------------------------------------------------------
+  ImageProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-image-processor"
+      CodeUri: pipeline_src/ # where the function code lives locally (SAM will zip and upload this)
+      Handler: app.handler
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref FunctionTimeout
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole" # Existing pre-created sandbox role. Do not have the permission to crete new security role.
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables: # will be passed to the .py code
+          OUTPUT_BUCKET: !Ref OutputBucket
+          MODEL_PROTOTXT: MobileNetSSD_deploy.prototxt
+          MODEL_WEIGHTS: MobileNetSSD_deploy.caffemodel
+      Events:
+        ImageUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref InputBucket
+            Events: s3:ObjectCreated:*
+
+  # ---------------------------------------------------------------------
+  # 4 - CloudWatch Logs group for the function 
+  # ---------------------------------------------------------------------
+  ImageProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ImageProcessorFunction}"
+      RetentionInDays: 7 # to keep the budget safe even if normally logs stays forever and slowly cost money.
+
+Outputs:
+  InputBucketName:
+    Description: Upload images here to trigger processing (this is what generator.py should target)
+    Value: !Ref InputBucket
+
+  OutputBucketName:
+    Description: Processed images land here
+    Value: !Ref OutputBucket
+
+  FunctionName:
+    Value: !Ref ImageProcessorFunction
+
+  FunctionArn:
+    Value: !GetAtt ImageProcessorFunction.Arn
+
+  LogGroupName:
+    Value: !Ref ImageProcessorLogGroup

@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Microservices image-processing pipeline.
+  Three independent Lambda functions — one per operation — each with its own
+  input bucket and memory allocation sized to its actual needs.
+
+Parameters:
+  ResizeMemorySize:
+    Type: Number
+    Default: 256
+    Description: >
+      256MB is enough for opencv resize (no model involved).
+      Monolith uses 1024MB for this same operation.
+      Cost saving = (1024-256)/1024 * duration_resize * price_per_GBs.
+
+  GreyscaleMemorySize:
+    Type: Number
+    Default: 256
+
+  DetectMemorySize:
+    Type: Number
+    Default: 1024
+    Description: Needs ~800MB+ for the MobileNet-SSD model + DNN inference.
+
+  FunctionTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda timeout in seconds (max 900).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Timeout: !Ref FunctionTimeout
+    # IAM is read-only in the sandbox — use the pre-created LabRole.
+    Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+    Environment:
+      Variables:
+        OUTPUT_BUCKET: !Ref OutputBucket
+    Tracing: Active
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # 1 - Shared output bucket
+  # ---------------------------------------------------------------------
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-ms-output-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireProcessedOutputs
+            Status: Enabled
+            ExpirationInDays: 3 # to avoid get charged a storage fee
+
+  # ---------------------------------------------------------------------
+  # 2 - # Lambda Layer — opencv + numpy, shared by all three functions.
+  #     The model files (.caffemodel / .prototxt) are in pipeline_src/ alongside
+  #     the code, but they are loaded LAZILY — only the detect function loads them.
+  # ---------------------------------------------------------------------
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-ms-deps"
+      Description: opencv-python-headless + numpy, built for Lambda's Linux/x86_64 runtime
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # ---------------------------------------------------------------------
+  # RESIZE — separate input bucket, 256MB, handler: app.resize_handler
+  # ---------------------------------------------------------------------
+  ResizeInputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-ms-resize-in-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTestUploads
+            Status: Enabled
+            ExpirationInDays: 3
+
+  ResizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-resize"
+      CodeUri: pipeline_src/
+      Handler: app.resize_handler
+      MemorySize: !Ref ResizeMemorySize
+      Layers:
+        - !Ref DependenciesLayer
+      Events:
+        Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref ResizeInputBucket
+            Events: s3:ObjectCreated:*
+
+  ResizeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ResizeFunction}"
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------------
+  # GREYSCALE — separate input bucket, 256MB, handler: app.greyscale_handler
+  # ---------------------------------------------------------------------
+  GreyscaleInputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-ms-grey-in-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTestUploads
+            Status: Enabled
+            ExpirationInDays: 3
+
+  GreyscaleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-greyscale"
+      CodeUri: pipeline_src/
+      Handler: app.greyscale_handler
+      MemorySize: !Ref GreyscaleMemorySize
+      Layers:
+        - !Ref DependenciesLayer
+      Events:
+        Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref GreyscaleInputBucket
+            Events: s3:ObjectCreated:*
+
+  GreyscaleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${GreyscaleFunction}"
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------------
+  # DETECT — separate input bucket, 1024MB, handler: app.detection_handler
+  # ---------------------------------------------------------------------
+  DetectInputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-ms-detect-in-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTestUploads
+            Status: Enabled
+            ExpirationInDays: 3
+
+  DetectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-detect"
+      CodeUri: pipeline_src/
+      Handler: app.detection_handler
+      MemorySize: !Ref DetectMemorySize
+      Layers:
+        - !Ref DependenciesLayer
+      Events:
+        Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref DetectInputBucket
+            Events: s3:ObjectCreated:*
+
+  DetectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DetectFunction}"
+      RetentionInDays: 7
+
+Outputs:
+  ResizeInputBucketName:
+    Value: !Ref ResizeInputBucket
+    Description: Upload here to trigger resize (--operation resize in generator.py)
+
+  GreyscaleInputBucketName:
+    Value: !Ref GreyscaleInputBucket
+    Description: Upload here to trigger greyscale
+
+  DetectInputBucketName:
+    Value: !Ref DetectInputBucket
+    Description: Upload here to trigger detection
+
+  OutputBucketName:
+    Value: !Ref OutputBucket
+
+  ResizeFunctionName:
+    Value: !Ref ResizeFunction
+
+  GreyscaleFunctionName:
+    Value: !Ref GreyscaleFunction
+
+  DetectFunctionName:
+    Value: !Ref DetectFunction
